@@ -17,6 +17,7 @@ import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 import {FixedPoint96} from "v4-core/src/libraries/FixedPoint96.sol";
 import {SafeCast} from "v4-core/src/libraries/SafeCast.sol";
 import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
+import {Position} from "v4-core/src/libraries/Position.sol";
 import {HookFlags} from "./HookFlags.sol";
 
 /// @title PanicHook
@@ -41,6 +42,11 @@ import {HookFlags} from "./HookFlags.sol";
 /// Fees are credited to the hook as ERC-6909 claims inside the swap, so a fee-bearing swap never depends on
 /// the PoolManager already holding the paired currency, and a recipient that cannot receive native ETH can
 /// only block its own claim, never trading.
+///
+/// Same-block liquidity: a position that was added to in the current block and is touched again in that block
+/// forfeits the fees it earned in between (including its share of in-swap donations). They are donated to the
+/// remaining in-range liquidity, so liquidity that exists only around a trader's own swap cannot recapture the
+/// LP share of that trader's hook fee.
 ///
 /// There is no owner, no pause and no upgrade path: every fee, threshold, share and the reference window
 /// is a compile-time constant.
@@ -145,6 +151,9 @@ contract PanicHook is IHooks, IUnlockCallback {
     /// @dev Search hint: index of the observation at or before the start of the last computed window.
     uint256 private windowStartHint;
 
+    /// @notice Last block in which liquidity was added to a position, keyed by the v4 position key.
+    mapping(bytes32 positionKey => uint256 blockNumber) public lastAddedBlock;
+
     // ------------------------------------------------------------------------------------------------
     // Fee buckets (all in the paired currency, backed 1:1 by ERC-6909 claims held by this contract)
     // ------------------------------------------------------------------------------------------------
@@ -183,6 +192,7 @@ contract PanicHook is IHooks, IUnlockCallback {
     event OracleFundClaimed(address indexed caller, uint256 amount);
     event DonatedToLiquidityProviders(address indexed caller, uint256 amount);
     event BuybackAndBurn(address indexed caller, uint256 spent, uint256 burned, uint256 impliedAtReference);
+    event SameBlockFeesForfeited(bytes32 indexed positionKey, uint256 pairedAmount, uint256 panicAmount);
 
     error NotPoolManager();
     error HookNotImplemented();
@@ -230,17 +240,17 @@ contract PanicHook is IHooks, IUnlockCallback {
             beforeInitialize: true,
             afterInitialize: true,
             beforeAddLiquidity: false,
-            afterAddLiquidity: false,
+            afterAddLiquidity: true,
             beforeRemoveLiquidity: false,
-            afterRemoveLiquidity: false,
+            afterRemoveLiquidity: true,
             beforeSwap: true,
             afterSwap: true,
             beforeDonate: false,
             afterDonate: false,
             beforeSwapReturnDelta: true,
             afterSwapReturnDelta: true,
-            afterAddLiquidityReturnDelta: false,
-            afterRemoveLiquidityReturnDelta: false
+            afterAddLiquidityReturnDelta: true,
+            afterRemoveLiquidityReturnDelta: true
         });
     }
 
@@ -385,6 +395,40 @@ contract PanicHook is IHooks, IUnlockCallback {
     }
 
     // ------------------------------------------------------------------------------------------------
+    // Liquidity callbacks (same-block fee forfeiture)
+    // ------------------------------------------------------------------------------------------------
+
+    /// @inheritdoc IHooks
+    function afterAddLiquidity(
+        address sender,
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata params,
+        BalanceDelta,
+        BalanceDelta feesAccrued,
+        bytes calldata
+    ) external override onlyPoolManager returns (bytes4, BalanceDelta) {
+        _requireOurPool(key);
+        bytes32 positionKey = Position.calculatePositionKey(sender, params.tickLower, params.tickUpper, params.salt);
+        BalanceDelta forfeited = _forfeitSameBlockFees(positionKey, feesAccrued);
+        lastAddedBlock[positionKey] = block.number;
+        return (IHooks.afterAddLiquidity.selector, forfeited);
+    }
+
+    /// @inheritdoc IHooks
+    function afterRemoveLiquidity(
+        address sender,
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata params,
+        BalanceDelta,
+        BalanceDelta feesAccrued,
+        bytes calldata
+    ) external override onlyPoolManager returns (bytes4, BalanceDelta) {
+        _requireOurPool(key);
+        bytes32 positionKey = Position.calculatePositionKey(sender, params.tickLower, params.tickUpper, params.salt);
+        return (IHooks.afterRemoveLiquidity.selector, _forfeitSameBlockFees(positionKey, feesAccrued));
+    }
+
+    // ------------------------------------------------------------------------------------------------
     // Unused callbacks (not enabled; revert if ever reached)
     // ------------------------------------------------------------------------------------------------
 
@@ -397,34 +441,12 @@ contract PanicHook is IHooks, IUnlockCallback {
         revert HookNotImplemented();
     }
 
-    function afterAddLiquidity(
-        address,
-        PoolKey calldata,
-        ModifyLiquidityParams calldata,
-        BalanceDelta,
-        BalanceDelta,
-        bytes calldata
-    ) external pure override returns (bytes4, BalanceDelta) {
-        revert HookNotImplemented();
-    }
-
     function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
         external
         pure
         override
         returns (bytes4)
     {
-        revert HookNotImplemented();
-    }
-
-    function afterRemoveLiquidity(
-        address,
-        PoolKey calldata,
-        ModifyLiquidityParams calldata,
-        BalanceDelta,
-        BalanceDelta,
-        bytes calldata
-    ) external pure override returns (bytes4, BalanceDelta) {
         revert HookNotImplemented();
     }
 
@@ -497,7 +519,10 @@ contract PanicHook is IHooks, IUnlockCallback {
         if (spent < budget) burnBucket += budget - spent;
 
         uint256 implied = pairedToPanicAtSqrtPrice(spent, refSqrtPriceX96, panicIsCurrency0);
-        uint256 minimum = FullMath.mulDivRoundingUp(implied, MIN_BUYBACK_OUTPUT_BPS, BPS);
+        // ceil(98% of the exact reference quote), computed from the unrounded quote.
+        (uint256 scaled, bool inexact) =
+            _pairedToPanic(spent * MIN_BUYBACK_OUTPUT_BPS, refSqrtPriceX96, panicIsCurrency0);
+        uint256 minimum = scaled / BPS + ((inexact || scaled % BPS != 0) ? 1 : 0);
         if (minimum == 0) minimum = 1;
         if (burned < minimum) revert BuybackBelowReference(burned, minimum);
         emit BuybackAndBurn(msg.sender, spent, burned, implied);
@@ -627,7 +652,16 @@ contract PanicHook is IHooks, IUnlockCallback {
     function pairedToPanicAtSqrtPrice(uint256 pairedAmount, uint160 sqrtPriceX96, bool panicIs0)
         public
         pure
-        returns (uint256)
+        returns (uint256 result)
+    {
+        (result,) = _pairedToPanic(pairedAmount, sqrtPriceX96, panicIs0);
+    }
+
+    /// @dev floor(pairedAmount * price) in PANIC units, and whether a fractional unit was discarded.
+    function _pairedToPanic(uint256 pairedAmount, uint160 sqrtPriceX96, bool panicIs0)
+        internal
+        pure
+        returns (uint256 result, bool inexact)
     {
         (uint256 num, uint256 den) =
             panicIs0 ? (FixedPoint96.Q96, uint256(sqrtPriceX96)) : (uint256(sqrtPriceX96), FixedPoint96.Q96);
@@ -635,9 +669,12 @@ contract PanicHook is IHooks, IUnlockCallback {
         // first division's remainder. With pairedAmount*num = q*den + r, the missing correction
         // is floor(((q*num % den) + floor(r*num/den)) / den). Its numerator is < den + num,
         // so it fits in 161 bits. Only the final fractional PANIC unit is discarded.
+        // The result is exact only when both dropped remainders are zero.
         uint256 q = FullMath.mulDiv(pairedAmount, num, den);
         uint256 r = mulmod(pairedAmount, num, den);
-        return FullMath.mulDiv(q, num, den) + (mulmod(q, num, den) + FullMath.mulDiv(r, num, den)) / den;
+        uint256 carry = mulmod(q, num, den) + FullMath.mulDiv(r, num, den);
+        result = FullMath.mulDiv(q, num, den) + carry / den;
+        inexact = carry % den != 0 || mulmod(r, num, den) != 0;
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -674,6 +711,35 @@ contract PanicHook is IHooks, IUnlockCallback {
             _donate(pending);
             emit DonatedToLiquidityProviders(address(this), pending);
         }
+    }
+
+    /// @dev When the position was added to in this block, takes the fees it collects now (all earned since that
+    /// add) away from the caller via the returned delta, and gives them to the remaining in-range liquidity.
+    /// With no liquidity left in range, the paired part waits in the donation bucket and PANIC is burned.
+    function _forfeitSameBlockFees(bytes32 positionKey, BalanceDelta feesAccrued)
+        internal
+        returns (BalanceDelta forfeited)
+    {
+        if (lastAddedBlock[positionKey] != block.number) return BalanceDeltaLibrary.ZERO_DELTA;
+        int128 fees0 = feesAccrued.amount0();
+        int128 fees1 = feesAccrued.amount1();
+        if (fees0 <= 0 && fees1 <= 0) return BalanceDeltaLibrary.ZERO_DELTA;
+        uint256 amount0 = fees0 > 0 ? uint256(uint128(fees0)) : 0;
+        uint256 amount1 = fees1 > 0 ? uint256(uint128(fees1)) : 0;
+        forfeited = feesAccrued;
+
+        (uint256 paired, uint256 panicAmount) = panicIsCurrency0 ? (amount1, amount0) : (amount0, amount1);
+        // The returned delta credits this contract with the fees; donating, minting or taking settles it.
+        if (poolManager.getLiquidity(poolId) > 0) {
+            poolManager.donate(poolKey, amount0, amount1, "");
+        } else {
+            if (paired > 0) {
+                poolManager.mint(address(this), _paired().toId(), paired);
+                donationBucket += paired;
+            }
+            if (panicAmount > 0) poolManager.take(Currency.wrap(panic), DEAD, panicAmount);
+        }
+        emit SameBlockFeesForfeited(positionKey, paired, panicAmount);
     }
 
     function _donate(uint256 amount) internal {

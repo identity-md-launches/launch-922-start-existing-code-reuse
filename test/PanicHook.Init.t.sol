@@ -28,12 +28,9 @@ contract PanicHookInitTest is PanicTestBase {
         assertTrue(p.beforeInitialize && p.afterInitialize, "init callbacks");
         assertTrue(p.beforeSwap && p.afterSwap, "swap callbacks");
         assertTrue(p.beforeSwapReturnDelta && p.afterSwapReturnDelta, "swap return deltas");
-        assertFalse(
-            p.beforeAddLiquidity || p.afterAddLiquidity || p.beforeRemoveLiquidity || p.afterRemoveLiquidity
-                || p.beforeDonate || p.afterDonate || p.afterAddLiquidityReturnDelta
-                || p.afterRemoveLiquidityReturnDelta,
-            "no other permissions"
-        );
+        assertTrue(p.afterAddLiquidity && p.afterRemoveLiquidity, "liquidity callbacks");
+        assertTrue(p.afterAddLiquidityReturnDelta && p.afterRemoveLiquidityReturnDelta, "liquidity return deltas");
+        assertFalse(p.beforeAddLiquidity || p.beforeRemoveLiquidity || p.beforeDonate || p.afterDonate, "no others");
         assertEq(HookFlags.flagsOf(address(hook)), HookFlags.PANIC_HOOK, "address bits");
         assertEq(hook.REQUIRED_FLAGS(), HookFlags.PANIC_HOOK);
         assertTrue(HookFlags.matches(address(hook), HookFlags.PANIC_HOOK));
@@ -205,15 +202,21 @@ contract PanicHookInitTest is PanicTestBase {
         vm.expectRevert(PanicHook.HookNotImplemented.selector);
         hook.beforeAddLiquidity(address(this), key, mp, "");
         vm.expectRevert(PanicHook.HookNotImplemented.selector);
-        hook.afterAddLiquidity(address(this), key, mp, BalanceDelta.wrap(0), BalanceDelta.wrap(0), "");
-        vm.expectRevert(PanicHook.HookNotImplemented.selector);
         hook.beforeRemoveLiquidity(address(this), key, mp, "");
-        vm.expectRevert(PanicHook.HookNotImplemented.selector);
-        hook.afterRemoveLiquidity(address(this), key, mp, BalanceDelta.wrap(0), BalanceDelta.wrap(0), "");
         vm.expectRevert(PanicHook.HookNotImplemented.selector);
         hook.beforeDonate(address(this), key, 1, 1, "");
         vm.expectRevert(PanicHook.HookNotImplemented.selector);
         hook.afterDonate(address(this), key, 1, 1, "");
+    }
+
+    function test_liquidityCallbacksOnlyAcceptThePoolManager() public {
+        ModifyLiquidityParams memory mp = ModifyLiquidityParams(-60, 60, 1 ether, bytes32(0));
+        vm.prank(trader);
+        vm.expectRevert(PanicHook.NotPoolManager.selector);
+        hook.afterAddLiquidity(address(this), key, mp, BalanceDelta.wrap(0), BalanceDelta.wrap(0), "");
+        vm.prank(trader);
+        vm.expectRevert(PanicHook.NotPoolManager.selector);
+        hook.afterRemoveLiquidity(address(this), key, mp, BalanceDelta.wrap(0), BalanceDelta.wrap(0), "");
     }
 
     function test_poolManagerIsTheOnlyPathIntoSwapCallbacks() public {

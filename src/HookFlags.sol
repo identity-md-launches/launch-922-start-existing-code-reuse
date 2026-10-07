@@ -25,9 +25,11 @@ library HookFlags {
     uint160 internal constant ALL = (1 << 14) - 1;
 
     /// @notice The bits the Panic Monkeys hook address must carry: both initialization callbacks, both
-    /// swap callbacks, and both swap return deltas.
-    uint160 internal constant PANIC_HOOK = BEFORE_INITIALIZE | AFTER_INITIALIZE | BEFORE_SWAP | AFTER_SWAP
-        | BEFORE_SWAP_RETURN_DELTA | AFTER_SWAP_RETURN_DELTA;
+    /// swap callbacks and their return deltas, and the after-add/after-remove liquidity callbacks and their
+    /// return deltas (same-block fee forfeiture).
+    uint160 internal constant PANIC_HOOK = BEFORE_INITIALIZE | AFTER_INITIALIZE | AFTER_ADD_LIQUIDITY
+        | AFTER_REMOVE_LIQUIDITY | BEFORE_SWAP | AFTER_SWAP | BEFORE_SWAP_RETURN_DELTA | AFTER_SWAP_RETURN_DELTA
+        | AFTER_ADD_LIQUIDITY_RETURN_DELTA | AFTER_REMOVE_LIQUIDITY_RETURN_DELTA;
 
     /// @notice The permission bits a given address carries.
     function flagsOf(address hook) internal pure returns (uint160) {

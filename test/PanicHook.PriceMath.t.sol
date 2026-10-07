@@ -33,7 +33,12 @@ contract PanicHookPriceMathTest is PanicTestBase {
         uint256 observationsBefore = hook.observationCount();
         uint160 priceBefore = _sqrtPrice();
 
-        vm.expectRevert(abi.encodeWithSelector(PanicHook.BuybackBelowReference.selector, 11, 12));
+        // The floor is 98% of the unrounded quote, rounded up.
+        uint256 scaled = 13 * 9800 * uint256(ref) * uint256(ref);
+        uint256 denom = 10_000 * (uint256(1) << 192);
+        uint256 minimum = (scaled + denom - 1) / denom;
+        assertEq(minimum, 13);
+        vm.expectRevert(abi.encodeWithSelector(PanicHook.BuybackBelowReference.selector, 11, minimum));
         hook.buybackAndBurn(13);
 
         assertEq(hook.burnBucket(), 13);

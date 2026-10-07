@@ -139,7 +139,9 @@ contract PanicHookBucketsTest is PanicTestBase {
         _sellToDrawdown(1000);
         uint256 donation = hook.totalDonated();
 
-        // Removing a zero amount of liquidity collects fees owed to the position.
+        // Removing a zero amount of liquidity collects fees owed to the position. The position was added in
+        // setUp's block, so collect in a later block (same-block touches forfeit their fees).
+        vm.roll(block.number + 1);
         uint256 ethBefore = address(this).balance;
         BalanceDelta d = lpRouter.modifyLiquidity(
             key,

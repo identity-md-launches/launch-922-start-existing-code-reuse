@@ -96,12 +96,25 @@ contract PanicHookRevisionTest is PanicTestBase {
         vm.stopPrank();
         assertLe(attacker.balance, ethBefore, "no capture");
         assertLe(panic.balanceOf(attacker), panicBefore);
+        // The resident position was added in setUp's block; collect in the next one.
+        vm.roll(block.number + 1);
         BalanceDelta collected = lpRouter.modifyLiquidity(
             key,
             ModifyLiquidityParams(TickMath.minUsableTick(TICK_SPACING), TickMath.maxUsableTick(TICK_SPACING), 0, 0),
             ""
         );
         assertApproxEqAbs(uint256(int256(collected.amount0())), donation, 1, "resident LP receives donation");
+    }
+
+    function test_buybackFloorUsesTheUnroundedReferenceQuote() public {
+        _sellPanic(1e18);
+        _swap(true, -1e24, 11453882584939555244670964355);
+        _nextBlock(3600);
+        assertEq(hook.referenceSqrtPriceX96(), 11453879819504963640314164846);
+        _swap(true, -1e24, 11285843134733390162692706488);
+        // 1000 units at the reference buy 20.899989 PANIC units: 98% is 20.48, so 20 is not enough.
+        vm.expectRevert(abi.encodeWithSelector(PanicHook.BuybackBelowReference.selector, 20, 21));
+        hook.buybackAndBurn(1000);
     }
 
     function test_dustBuybackRevertsAndPreservesAllFunds() public {

@@ -87,7 +87,7 @@ three parts always sum to the fee exactly:
 | --- | --- | --- |
 | Panic Oracle Fund | 60% | `claimOracleFund()` burns the claims and `take`s the paired currency to the immutable `oracleFund` address (`0x788C311500FD3C15b8e44d6e2935fe7fF13E674b`). Only that address can ever receive it. |
 | Liquidity providers | 30% | Donated inside the taxed swap to liquidity in range at its end using `PoolManager.donate`, funded by burning claims. Only when no liquidity is in range does `donationBucket` retain the share. Anyone can flush that fallback with `donateToLiquidityProviders()` once liquidity returns; otherwise it reverts (`NoLiquidityToReceiveFees`). The next taxed swap also flushes a pending donation when liquidity is available. |
-| Burn | 10% | `buybackAndBurn()` / `buybackAndBurn(maxSpend)` spends `min(bucket, maxSpend, 1 ether)` on PANIC in this pool and `take`s every token bought straight to `0x000000000000000000000000000000000000dEaD`. Reverts with `BuybackBelowReference` if it would receive less than 98% of the PANIC the reference price implies for the amount spent. The cap and reference floor include the internal buy fee. Anything above the cap waits for the next call. |
+| Burn | 10% | `buybackAndBurn()` / `buybackAndBurn(maxSpend)` spends `min(bucket, maxSpend, 1 ether)` on PANIC in this pool and `take`s every token bought straight to `0x000000000000000000000000000000000000dEaD`. Reverts with `BuybackBelowReference` if it would receive less than `ceil(98%)` of the unrounded PANIC quote the reference price implies for the amount spent. The cap and reference floor include the internal buy fee. Anything above the cap waits for the next call. |
 
 The hook's claim balance always equals `oracleFundBucket + donationBucket + burnBucket`; the
 split allocates every minor unit, with no unassigned dust. `totalDonated` records the LP share
@@ -96,6 +96,20 @@ PANIC quote carries division remainders and rounds down only once, in either poo
 A buyback requires positive PANIC output and rounds its 98% minimum upward. Untradeably small burn balances stay
 accounted for until more fees accrue; wasting them on a zero-output swap is forbidden. Claim and
 donate impose no minimum amount.
+
+### Same-block liquidity forfeits its fees
+
+The LP share is donated inside the taxed swap, to liquidity in range at the swap's end. Without a
+guard, a seller could add a narrow position at the tick where their own sell ends, sell, and remove
+it in the same transaction, collecting most of the donation of their own hook fee (the 20% tier
+would effectively become about 14%). `afterAddLiquidity` and `afterRemoveLiquidity` therefore record
+the block in which each position (v4 position key: owner, ticks, salt) was last added to. When such
+a position is touched again in that same block, the fees it collects (everything earned since that
+add: LP fees and donations) are taken back through the callback's return delta and donated to the
+remaining in-range liquidity. If none is left in range, the paired part waits in `donationBucket` and
+the PANIC part goes to `0x...dEaD`. Liquidity that stays across a block boundary keeps its fees, so
+capturing the donation requires holding the position with real price exposure. An LP who adds and
+then collects or adds again within one block loses the fees earned in between.
 
 Because the buyback is checked against the reference and not the spot price, it only passes near a
 flat price when the LP fee plus impact stays under 2% (1.25% LP fee leaves 0.75% for impact), and
@@ -124,16 +138,16 @@ have been removed; the per-sell fee schedule is unchanged and there is no per-wa
     "afterInitialize": true,
     "beforeAddLiquidity": false,
     "beforeRemoveLiquidity": false,
-    "afterAddLiquidity": false,
-    "afterRemoveLiquidity": false,
+    "afterAddLiquidity": true,
+    "afterRemoveLiquidity": true,
     "beforeSwap": true,
     "afterSwap": true,
     "beforeDonate": false,
     "afterDonate": false,
     "beforeSwapReturnDelta": true,
     "afterSwapReturnDelta": true,
-    "afterAddLiquidityReturnDelta": false,
-    "afterRemoveLiquidityReturnDelta": false
+    "afterAddLiquidityReturnDelta": true,
+    "afterRemoveLiquidityReturnDelta": true
   },
   "inputs": {},
   "access": "none",
@@ -145,12 +159,15 @@ Notes on the record: the hook implements `IHooks` directly rather than inheritin
 (v4-periphery is not vendored); `access` is deliberately none of the Wizard's options because the
 brief forbids any admin. The constructor validates that the deployed address carries exactly the
 declared bits (`Hooks.validateHookPermissions`), so a mis-mined address cannot deploy. Required
-address bits: `beforeInitialize | afterInitialize | beforeSwap | afterSwap | beforeSwapReturnDelta |
-afterSwapReturnDelta` = `0x30CC` (12492).
+address bits: `beforeInitialize | afterInitialize | afterAddLiquidity | afterRemoveLiquidity |
+beforeSwap | afterSwap | beforeSwapReturnDelta | afterSwapReturnDelta | afterAddLiquidityReturnDelta |
+afterRemoveLiquidityReturnDelta` = `0x35CF` (13775).
 
 `beforeSwapReturnDelta` is enabled only to take the buy fee from the specified input; the hook never
 returns a delta that replaces the swap (no NoOp path). `afterSwapReturnDelta` only ever adds a
-positive fee on the unspecified currency, at most 30% of the amount it is taken from.
+positive fee on the unspecified currency, at most 30% of the amount it is taken from. The liquidity
+return deltas are non-zero only for a position touched twice in one block, and then equal exactly the
+fees that position collects, which the hook immediately donates, mints as a claim, or burns.
 
 ## Deployment parameters
 
@@ -162,7 +179,10 @@ positive fee on the unspecified currency, at most 30% of the amount it is taken 
 | `panic` | `$token` | The launch token the factory deploys just before the hook. |
 | `oracleFund` | `0x788C311500FD3C15b8e44d6e2935fe7fF13E674b` | Fixed oracle budget address. The only recipient `claimOracleFund` can ever pay. |
 
-Pool: PANIC paired with native ETH (`currency0 = address(0)`, `currency1 = PANIC`), LP fee 12500
+Pool: `launch.json` pairs PANIC with the ERC-20 at `0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7`
+(reported as IMD, 18 decimals, on Ethereum mainnet). `script/DeployPanic.s.sol` and most tests use a
+native-ETH pair (`currency0 = address(0)`, `currency1 = PANIC`) instead; the ERC-20 orientations
+are tested in `PanicHook.Flipped.t.sol`. LP fee 12500
 (1.25%, the launch policy's tier), any tick spacing. `beforeInitialize` accepts any static LP fee
 (so the listed tier is never refused), rejects the dynamic-fee flag, rejects a pool without PANIC,
 and rejects a second pool for the same hook. The hook address must be mined with
@@ -192,12 +212,15 @@ not broadcast anything and holds no keys.
 | `MAX_HOOK_FEE_BPS` | 3000 |
 | `ORACLE_SHARE_BPS` / `LP_SHARE_BPS` / `BURN_SHARE_BPS` | 6000 / 3000 / 1000 |
 | `MIN_BUYBACK_OUTPUT_BPS` | 9800 |
-| `MAX_BUYBACK_SPEND` | 1e18 minor units of the paired currency (1 ETH) |
+| `MAX_BUYBACK_SPEND` | 1e18 minor units of the paired currency (1 IMD for the manifest pair, 1 ETH for the script's pair) |
 
 ## Assumptions
 
-* The paired currency is native ETH (or another 18-decimal currency). `MAX_BUYBACK_SPEND` is
-  denominated in the paired currency's minor units; with a 6-decimal pair it would be meaningless.
+* The paired currency has 18 decimals (the manifest's IMD token, or native ETH in the script).
+  `MAX_BUYBACK_SPEND` is denominated in the paired currency's minor units; with a 6-decimal pair it
+  would be meaningless. With the IMD pair one call spends at most 1 IMD, so draining a large burn
+  bucket takes many calls whose gas (about 250k cold, 175k warm) may exceed the IMD burned on an
+  expensive chain. Nothing is lost; the cap is a compile-time constant and was left unchanged.
   The code otherwise supports any ERC-20 pair in either pool orientation (tested).
 * The paired currency is a plain token: no fee-on-transfer, no rebasing. PANIC itself is plain.
 * The pool is initialized by the launch factory in the same transaction as the hook deployment; the
@@ -217,11 +240,11 @@ permissionless and pay nothing to the caller) should periodically:
    capture them. The fallback still pays whoever is in range when it is flushed and retains JIT
    exposure; there was no in-range liquidity to receive it at the taxed swap's end. Immediate
    donation also does not prevent liquidity added before a victim swap from earning its fees;
-3. call `buybackAndBurn()` repeatedly (1 ETH per call, 98%-of-reference floor) to burn the burn
+3. call `buybackAndBurn()` repeatedly (1e18 paired minor units per call, 98%-of-reference floor) to burn the burn
    bucket. It reverts while the live price is more than about 2% above the reference, and may need
    `buybackAndBurn(maxSpend)` with a smaller amount in thin liquidity. The cap is per call, not per
    block or transaction: callers can loop and spend the available bucket. It does not bound a
-   sandwich to 1 ETH. The reference floor does not guarantee a quote close to spot during a crash.
+   sandwich to one cap. The reference floor does not guarantee a quote close to spot during a crash.
    A holder can provide PANIC-only liquidity for buybacks to consume and withdraw paired proceeds;
    liquidity operations carry no hook sell tax. No aggregate rate limit or spot floor is promised.
 
@@ -250,9 +273,10 @@ evidence:
 | token supply and transfer | `PanicMonkeys.t.sol` |
 | fee-bearing buy on a fresh manager, tokens-only pool | `test_feeBearingBuyWorksOnAFreshManagerWhosePoolHoldsTokensOnly` |
 | limited buys never pay fees on unfilled input | `test_partialDipBuyRevertsWithoutChargingOrMovingThePool`, `test_exactOutputLimitedDipBuyChargesOnlyRealisedInput`, `testFuzz_fullDipBuyFeeIsAtMostOnePercentOfPoolInput` |
+| a seller cannot recapture their own donation with same-block liquidity | `PanicHook.Jit.t.sol` |
 | historical LP fees cannot be captured by later JIT liquidity | `test_jitPositionCannotCaptureAnEarlierSwapsDonation`, `test_donationReachesTheLiquidityProviderOnWithdrawal` |
 | buyback dip fee and dust floor | `test_buybackCannotMoveTheReferenceAndPaysTheDipFee`, `test_partialBuybackReallocatesFeeOnlyOnRealisedInput`, `test_dustBuybackRevertsAndPreservesAllFunds`, `testFuzz_tinyBuybacksNeverRoundAwayTheReferenceFloor` |
-| reference quote preserves precision at dust amounts | `PanicHook.PriceMath.t.sol`: exact quote in both orientations, fuzz comparison to a single division, extreme prices, overflow refusal, and atomic rollback of the 13 wei buyback returning only 11 PANIC wei against a 12 wei minimum |
+| reference quote preserves precision at dust amounts | `PanicHook.PriceMath.t.sol`: exact quote in both orientations, fuzz comparison to a single division, extreme prices, overflow refusal, and atomic rollback of the 13 wei buyback returning only 11 PANIC wei against a 13 wei minimum; `test_buybackFloorUsesTheUnroundedReferenceQuote` |
 | recipient that rejects ETH | `test_claimToARecipientThatRejectsEthFailsWithoutBlockingSwaps` |
 
 Tests read no environment variables and do not depend on the caller. They pass in any order and in
@@ -278,12 +302,13 @@ Checked against the `uniswap-v4-security` and `eth-security` references:
   full hour from launch. The attack that remains is the one every TWAP has: holding the price down
   for an hour makes "down" the new normal, which is the brief's intended decay.
 * Integration limitations: exact-output sells and fee-bearing partial exact-input buys are refused.
-  The donation fallback retains JIT exposure; buybacks have a reference floor and a per-call cap,
+  Routers must send sells exact-input and price-limited dip buys exact-output. The donation fallback
+  retains JIT exposure; buybacks have a reference floor and a per-call cap,
   with no block cap or spot floor. Lower tax from sell splitting is accepted, as explained above.
 * Revision checks: `forge build`, `forge test` with 256 runs per fuzz test, and `forge fmt --check`.
-  No sell economics were changed. The advisory dust reproduction initially
-  accepted 11 PANIC wei where the exact reference quote required 12; it now reverts with
-  `BuybackBelowReference(11, 12)`. Exact-output sell rejection was reproduced and retained as
+  The sell fee schedule is unchanged. The latest revision adds same-block liquidity fee forfeiture
+  (the JIT self-recapture proof now passes) and computes the 98% buyback floor from the unrounded
+  reference quote, so the 13 wei dust buyback now reverts with `BuybackBelowReference(11, 13)`. Exact-output sell rejection was reproduced and retained as
   the documented integration limitation. Every finding is answered in `.imd-responses.json`.
   Scratch proof copies are removed before the deliverable's full test run; pinned inputs are unchanged.
   Slither/Mythril, chain forks, and deployment transactions were not run in this revision.

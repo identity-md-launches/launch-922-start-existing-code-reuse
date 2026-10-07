@@ -14,6 +14,7 @@ import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 
 /// @dev Ghost amounts come from pool Swap events and actual wallet transfers, not hook buckets.
 /// The TWAP model integrates the independently recorded spot-price timeline, without reading
@@ -41,6 +42,7 @@ contract PanicAccountingHandler is Test {
     uint256 public spent;
     uint256 public burned;
     uint256 public successfulSwaps;
+    uint256 public successfulExactOutputBuys;
     uint256 public successfulBuybacks;
     uint256 public rejectedBuybacks;
 
@@ -80,14 +82,27 @@ contract PanicAccountingHandler is Test {
         if (maximum == 0) return;
         if (maximum > 1200 ether) maximum = 1200 ether;
         uint256 amount = bound(amountSeed, 1, maximum);
-        _trade(actor, false, amount);
+        _trade(actor, false, amount, false);
     }
 
     function buy(uint256 actorSeed, uint256 amountSeed) external {
-        _trade(actors[actorSeed % 3], true, bound(amountSeed, 1, 200 ether));
+        _trade(actors[actorSeed % 3], true, bound(amountSeed, 1, 200 ether), false);
     }
 
-    function _trade(address actor, bool isBuy, uint256 amount) private {
+    function buyExactOutput(uint256 actorSeed, uint256 amountSeed) external {
+        (uint160 sqrt,,,) = manager.getSlot0(key.toId());
+        uint256 liquidity = manager.getLiquidity(key.toId());
+        uint256 reserve =
+            panicIs0 ? FullMath.mulDiv(liquidity, 1 << 96, sqrt) : FullMath.mulDiv(liquidity, sqrt, 1 << 96);
+        // Request at most 1% of the virtual reserve to keep exact output reachable throughout a sequence.
+        uint256 maximum = reserve / 100;
+        if (maximum > 100 ether) maximum = 100 ether;
+        assertGt(maximum, 0, "campaign retains usable full-range liquidity");
+        _trade(actors[actorSeed % 3], true, bound(amountSeed, 1, maximum), true);
+        successfulExactOutputBuys++;
+    }
+
+    function _trade(address actor, bool isBuy, uint256 amount, bool exactOutput) private {
         uint160 referencePrice = _freezeReference();
         (uint160 beforePrice,,,) = manager.getSlot0(key.toId());
         uint256 pairedBefore = paired.balanceOf(actor);
@@ -98,10 +113,13 @@ contract PanicAccountingHandler is Test {
 
         vm.recordLogs();
         vm.prank(actor);
-        BalanceDelta d = router.swap{value: isBuy && paired.isAddressZero() ? amount : 0}(
+        uint256 value = isBuy && paired.isAddressZero() ? (exactOutput ? actor.balance : amount) : 0;
+        BalanceDelta d = router.swap{value: value}(
             key,
             SwapParams(
-                zeroForOne, -int256(amount), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+                zeroForOne,
+                exactOutput ? int256(amount) : -int256(amount),
+                zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
             ),
             PoolSwapTest.TestSettings(false, false),
             ""
@@ -110,12 +128,18 @@ contract PanicAccountingHandler is Test {
         uint256 actualFee;
         if (isBuy) {
             uint256 paid = pairedBefore - paired.balanceOf(actor);
-            assertEq(paid, amount, "exact input buy budget");
             actualFee = paid - poolAmount;
             uint256 expected = _drawdown(beforePrice, referencePrice) >= 500 ? poolAmount / 100 : 0;
-            // Reserving a fee from an inclusive input budget can round down one extra wei.
-            assertLe(actualFee, expected);
-            assertLe(expected - actualFee, 1);
+            if (exactOutput) {
+                assertEq(panic.balanceOf(actor) - panicBefore, amount, "exact output delivered");
+                assertEq(actualFee, expected, "exact output fee on realised paired input");
+            } else {
+                assertEq(paid, amount, "exact input buy budget");
+                // Reserving a fee from an inclusive input budget can round down one extra wei.
+                assertLe(actualFee, expected);
+                assertLe(expected - actualFee, 1);
+            }
+            assertEq(paid, uint256(-int256(panicIs0 ? d.amount1() : d.amount0())), "wallet input matches delta");
             assertEq(panic.balanceOf(actor) - panicBefore, uint256(uint128(panicIs0 ? d.amount0() : d.amount1())));
         } else {
             actualFee = poolAmount - (paired.balanceOf(actor) - pairedBefore);
@@ -180,8 +204,12 @@ contract PanicAccountingHandler is Test {
             assertLe(used, bucket);
             assertGt(bought, 0);
             assertEq(panic.balanceOf(DEAD) - deadBefore, bought);
-            // The independent 98% output-floor property failed for tiny budgets. Its full
-            // failing reproduction is reported in .imd-findings.json, not weakened here.
+            // These campaigns stay near parity, where the square fits in uint256. A single
+            // division provides an independent quote without calling the hook's conversion helper.
+            uint256 square = uint256(referencePrice) * uint256(referencePrice);
+            uint256 implied =
+                panicIs0 ? FullMath.mulDiv(used, 1 << 192, square) : FullMath.mulDiv(used, square, 1 << 192);
+            assertGe(bought * 10_000, implied * 9800, "98% reference output floor, including dust budgets");
             _accrue(fee);
             spent += used;
             burned += bought;
@@ -273,6 +301,7 @@ contract PanicAccountingHandler is Test {
 
     function _stateHash() private view returns (bytes32) {
         (uint160 sqrt, int24 tick,,) = manager.getSlot0(key.toId());
+        (uint256 growth0, uint256 growth1) = manager.getFeeGrowthGlobals(key.toId());
         return keccak256(
             abi.encode(
                 hook.oracleFundBucket(),
@@ -287,7 +316,9 @@ contract PanicAccountingHandler is Test {
                 tick,
                 hook.observationCount(),
                 hook.lastObservedBlock(),
-                hook.lastObservedTick()
+                hook.lastObservedTick(),
+                growth0,
+                growth1
             )
         );
     }

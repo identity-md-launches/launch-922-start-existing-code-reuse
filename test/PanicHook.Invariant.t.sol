@@ -32,7 +32,7 @@ abstract contract PanicAccountingInvariantBase is PanicTestBase {
             }
             vm.stopPrank();
         }
-        bytes4[] memory selectors = new bytes4[](7);
+        bytes4[] memory selectors = new bytes4[](8);
         selectors[0] = handler.sell.selector;
         selectors[1] = handler.buy.selector;
         selectors[2] = handler.advance.selector;
@@ -40,6 +40,7 @@ abstract contract PanicAccountingInvariantBase is PanicTestBase {
         selectors[4] = handler.donate.selector;
         selectors[5] = handler.buyback.selector;
         selectors[6] = handler.transferPanic.selector;
+        selectors[7] = handler.buyExactOutput.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
     }
@@ -96,6 +97,21 @@ abstract contract PanicAccountingInvariantBase is PanicTestBase {
         assertGt(handler.successfulBuybacks(), 0);
         assertGe(handler.rejectedBuybacks(), 2);
         assertGt(handler.claimed(), 0);
+        invariant_conservationReferenceAndSupply();
+    }
+
+    function test_handlerMixesExactOutputAndExactInputAcrossTheHour() public {
+        handler.buyExactOutput(0, 1); // Smallest output, while not down.
+        handler.sell(1, 1200 ether);
+        handler.buyExactOutput(2, 1 ether); // Dip fee in the afterSwap return delta.
+        handler.buy(0, 1 ether); // Dip fee in the beforeSwap return delta.
+        handler.buyback(1, 0.1 ether);
+        invariant_conservationReferenceAndSupply();
+        handler.advance(3600);
+        handler.buyExactOutput(0, 1 ether); // Flat for an hour: no hook fee again.
+        handler.claim(2);
+        assertEq(handler.successfulExactOutputBuys(), 3);
+        assertEq(handler.successfulSwaps(), 5);
         invariant_conservationReferenceAndSupply();
     }
 }

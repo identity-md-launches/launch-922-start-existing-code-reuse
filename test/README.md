@@ -12,15 +12,20 @@ This is offline integration coverage, not a rehearsal against a live chain deplo
 
 `PanicHook.Invariant.t.sol` adds three campaigns: native pairing, PANIC as currency0, and PANIC
 as currency1. Each runs 256 sequences of 64 randomly ordered actions, with unexpected reverts
-treated as failures. Three funded traders buy, sell, transfer PANIC, advance blocks/time, and
+treated as failures. Three funded traders buy with exact input or exact output, sell, transfer PANIC, advance blocks/time, and
 call the permissionless fee outlets. Inputs include zero outlet budgets and one-wei trades.
-The deterministic handler test exercises both funded operations and rejection paths.
+The deterministic handler tests exercise funded operations, rejection paths, and both buy modes
+before and after a full reference window. Exact-output amounts include one wei and are bounded by
+the current virtual PANIC reserve so the campaigns continue to execute meaningful trades.
 
 The handler derives taxes from actual wallet movements and the PoolManager's swap event,
 then maintains an independent allocation ledger. The invariant checks claims against all
 three buckets, lifetime fee conservation including buyback fees, the fixed claim recipient,
 delivery of every bought token to the dead address, fixed token supply, and settled manager
-deltas. A separate spot-price timeline is integrated over one hour to check the reference;
+deltas. Every successful buyback must also satisfy the 98% reference output floor, including
+tiny budgets. Its independent quote squares the reference price and divides once, without calling
+the hook's quote helper. Failed buybacks must preserve LP fee growth as well as balances and buckets.
+A separate spot-price timeline is integrated over one hour to check the reference;
 it never reads the hook's observation array. Full-range liquidity is kept in these campaigns;
 deferred donations and zero-liquidity failure/recovery are exercised by the existing bucket suite.
 
@@ -30,17 +35,16 @@ successful calls and rollback after expected failures, including self-transfers,
 zero amounts, and unlimited approvals. Its finite-allowance rollback property runs 1,000 cases.
 The bucket split fuzz test now performs real swaps rather than asserting an arithmetic identity.
 
-The source revision reported historical findings in `.imd-findings.json` with standalone
-Foundry proofs. Sell splitting is now explicitly accepted and the anti-splitting comparisons
-have been removed. The remaining historical finding was:
+`PanicHook.Atomicity.t.sol` checks rejection and recovery with native currency and both ERC-20
+orderings. Partial fee-bearing exact-input buys, unsupported exact-output sells, zero swaps, and
+overpriced buybacks must roll back wallet balances, pool price, LP fee growth, claims, and oracle
+observations. Successful operations immediately afterward check that a failed callback cannot
+poison the next swap's transient fee context or consume the block's observation. A native-recipient
+probe attempts to reenter both claim and buyback during payout; neither can withdraw a second
+bucket, and a later legitimate buyback remains usable.
 
-- Small buybacks can accept less than the 98% reference floor because the reference conversion
-  truncates twice. The independent output-floor property found this during invariant testing.
-  The failing property is preserved in the report; the passing accounting invariant makes no
-  claim that this price-floor defect is fixed and still exercises small buyback amounts.
-
-Proofs were run under `test/scratch/` with `forge test --match-path`, observed to fail on the
-stated assertions, and embedded in the report. Their failing test sources are not part of the
-default passing suite. Build/dependency configuration and sell economics are unchanged. The
-constructor now enforces the fixed Oracle Fund recipient; initialization tests cover accepted,
-zero, and different recipients, and claim tests cover payout and recipient transfer failure.
+The historical double-truncation issue is fixed in the supplied implementation. The existing
+`PanicHook.PriceMath.t.sol` regression and the restored invariant output-floor check guard it.
+Sell splitting is explicitly accepted; there are no anti-splitting comparisons. The fixed Oracle
+Fund recipient remains covered by constructor and payout tests. No production contracts,
+deployment files, or build/dependency configuration are changed by these test additions.

@@ -7,9 +7,11 @@ import {PanicHook} from "src/PanicHook.sol";
 import {PanicMonkeys} from "src/PanicMonkeys.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
+import {PoolModifyLiquidityTest} from "v4-core/src/test/PoolModifyLiquidityTest.sol";
+import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
-import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
@@ -29,6 +31,7 @@ contract PanicAccountingHandler is Test {
     PanicMonkeys public immutable panic;
     IPoolManager public immutable manager;
     PoolSwapTest public immutable router;
+    PoolModifyLiquidityTest public immutable lpRouter;
     Currency public paired;
     PoolKey private key;
     bool private immutable panicIs0;
@@ -45,6 +48,18 @@ contract PanicAccountingHandler is Test {
     uint256 public successfulExactOutputBuys;
     uint256 public successfulBuybacks;
     uint256 public rejectedBuybacks;
+    uint256 public liquidityAdds;
+    uint256 public sameBlockRemovals;
+    uint256 public laterRemovals;
+
+    /// @dev One narrow position per actor (salt = actor), tracked independently of the hook.
+    struct Range {
+        int24 lower;
+        int24 upper;
+        uint128 liquidity;
+        uint256 addedBlock;
+    }
+    mapping(address => Range) public ranges;
 
     struct Spot {
         uint256 time;
@@ -55,11 +70,19 @@ contract PanicAccountingHandler is Test {
     int24 private frozenReference;
     int24 private immutable launchTick;
 
-    constructor(PanicHook h, PanicMonkeys p, IPoolManager m, PoolSwapTest r, PoolKey memory k) {
+    constructor(
+        PanicHook h,
+        PanicMonkeys p,
+        IPoolManager m,
+        PoolSwapTest r,
+        PoolModifyLiquidityTest lr,
+        PoolKey memory k
+    ) {
         hook = h;
         panic = p;
         manager = m;
         router = r;
+        lpRouter = lr;
         key = k;
         panicIs0 = Currency.unwrap(k.currency0) == address(p);
         paired = panicIs0 ? k.currency1 : k.currency0;
@@ -240,6 +263,116 @@ contract PanicAccountingHandler is Test {
         assertTrue(panic.transfer(to, amount));
         assertEq(panic.balanceOf(from), from == to ? fromBefore : fromBefore - amount);
         assertEq(panic.balanceOf(to), from == to ? toBefore : toBefore + amount);
+    }
+
+    /// @dev Adds narrow liquidity around the current tick, possibly to a position already added to in
+    /// this block. Fees the position earned since a same-block add are forfeited, so the actor then pays
+    /// exactly the rounded-up principal.
+    function addLiquidity(uint256 actorSeed, uint256 offsetSeed, uint256 widthSeed, uint256 liquiditySeed) external {
+        address actor = actors[actorSeed % 3];
+        Range storage r = ranges[actor];
+        if (r.liquidity == 0) {
+            int24 spacing = key.tickSpacing;
+            (, int24 tick,,) = manager.getSlot0(key.toId());
+            int24 base = tick / spacing * spacing;
+            if (tick < 0 && tick % spacing != 0) base -= spacing;
+            r.lower = base - int24(int256(bound(offsetSeed, 0, 4))) * spacing;
+            r.upper = base + int24(int256(bound(widthSeed, 1, 5))) * spacing;
+        }
+        uint128 liquidity = uint128(bound(liquiditySeed, 1e15, 1e22));
+        bool sameBlock = r.liquidity > 0 && r.addedBlock == block.number;
+        if (r.liquidity > 0 && !sameBlock) {
+            // Collect fees from an earlier block first with a zero-liquidity poke, which the hook leaves alone;
+            // the test router cannot settle an add whose fees exceed its principal on one side.
+            (uint256 owed0, uint256 owed1) = (key.currency0.balanceOf(actor), key.currency1.balanceOf(actor));
+            vm.prank(actor);
+            lpRouter.modifyLiquidity(key, ModifyLiquidityParams(r.lower, r.upper, 0, _salt(actor)), "");
+            assertGe(key.currency0.balanceOf(actor), owed0, "poke only pays out");
+            assertGe(key.currency1.balanceOf(actor), owed1, "poke only pays out");
+        }
+        (uint256 need0, uint256 need1) = _principal(r.lower, r.upper, liquidity, true);
+        uint256 before0 = key.currency0.balanceOf(actor);
+        uint256 before1 = key.currency1.balanceOf(actor);
+        bytes32 beforeBuckets = _bucketHash();
+        vm.prank(actor);
+        lpRouter.modifyLiquidity{value: key.currency0.isAddressZero() ? need0 + 1 : 0}(
+            key, ModifyLiquidityParams(r.lower, r.upper, int256(uint256(liquidity)), _salt(actor)), ""
+        );
+        // A same-block add forfeits the fees earned since the earlier add, so it pays exactly principal too.
+        assertEq(before0 - key.currency0.balanceOf(actor), need0, "add pays exactly principal0");
+        assertEq(before1 - key.currency1.balanceOf(actor), need1, "add pays exactly principal1");
+        // Full-range liquidity is always in range, so forfeited fees are donated, never bucketed.
+        assertEq(_bucketHash(), beforeBuckets, "liquidity changes leave fee buckets untouched");
+        r.liquidity += liquidity;
+        r.addedBlock = block.number;
+        liquidityAdds++;
+    }
+
+    /// @dev Removes part or all of an actor's position. Within the block of its last add, the actor
+    /// receives exactly the rounded-down principal: every fee earned in between is forfeited.
+    function removeLiquidity(uint256 actorSeed, uint256 amountSeed) external {
+        address actor = actors[actorSeed % 3];
+        Range storage r = ranges[actor];
+        if (r.liquidity == 0) return;
+        uint128 liquidity = uint128(bound(amountSeed, 1, r.liquidity));
+        if (liquidity < 1e15 && liquidity != r.liquidity) liquidity = r.liquidity;
+        bool sameBlock = r.addedBlock == block.number;
+        (uint256 out0, uint256 out1) = _principal(r.lower, r.upper, liquidity, false);
+        if (out0 == 0 && out1 == 0) return; // The test router asserts on an empty withdrawal.
+        uint256 before0 = key.currency0.balanceOf(actor);
+        uint256 before1 = key.currency1.balanceOf(actor);
+        bytes32 beforeBuckets = _bucketHash();
+        vm.prank(actor);
+        lpRouter.modifyLiquidity(
+            key, ModifyLiquidityParams(r.lower, r.upper, -int256(uint256(liquidity)), _salt(actor)), ""
+        );
+        uint256 got0 = key.currency0.balanceOf(actor) - before0;
+        uint256 got1 = key.currency1.balanceOf(actor) - before1;
+        if (sameBlock) {
+            assertEq(got0, out0, "same-block removal returns principal0 only");
+            assertEq(got1, out1, "same-block removal returns principal1 only");
+            sameBlockRemovals++;
+        } else {
+            assertGe(got0, out0, "a position held across blocks keeps its fees");
+            assertGe(got1, out1);
+            laterRemovals++;
+        }
+        assertEq(_bucketHash(), beforeBuckets, "liquidity changes leave fee buckets untouched");
+        r.liquidity -= liquidity;
+    }
+
+    function _principal(int24 lower, int24 upper, uint128 liquidity, bool roundUp)
+        private
+        view
+        returns (uint256 amount0, uint256 amount1)
+    {
+        (uint160 sqrt,,,) = manager.getSlot0(key.toId());
+        uint160 a = TickMath.getSqrtPriceAtTick(lower);
+        uint160 b = TickMath.getSqrtPriceAtTick(upper);
+        if (sqrt <= a) {
+            amount0 = SqrtPriceMath.getAmount0Delta(a, b, liquidity, roundUp);
+        } else if (sqrt < b) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrt, b, liquidity, roundUp);
+            amount1 = SqrtPriceMath.getAmount1Delta(a, sqrt, liquidity, roundUp);
+        } else {
+            amount1 = SqrtPriceMath.getAmount1Delta(a, b, liquidity, roundUp);
+        }
+    }
+
+    function _salt(address actor) private pure returns (bytes32) {
+        return bytes32(uint256(uint160(actor)));
+    }
+
+    function _bucketHash() private view returns (bytes32) {
+        return keccak256(
+            abi.encode(
+                hook.oracleFundBucket(),
+                hook.donationBucket(),
+                hook.burnBucket(),
+                hook.totalDonated(),
+                manager.balanceOf(address(hook), paired.toId())
+            )
+        );
     }
 
     function modelReferenceTick() public view returns (int24) {

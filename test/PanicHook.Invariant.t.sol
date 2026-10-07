@@ -7,6 +7,9 @@ import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary
 import {PanicAccountingHandler} from "./handlers/PanicAccountingHandler.sol";
 import {PanicTestBase} from "./utils/PanicTestBase.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {Vm} from "forge-std/Vm.sol";
+import {PanicHook} from "src/PanicHook.sol";
+import {PoolModifyLiquidityTest} from "v4-core/src/test/PoolModifyLiquidityTest.sol";
 
 /// @dev No storage edits, mocked callbacks, RPC, or token minting after setup. Each campaign
 /// starts at a flat price and can cross all tiers in either direction, in the same or later blocks.
@@ -19,7 +22,9 @@ abstract contract PanicAccountingInvariantBase is PanicTestBase {
     function _startCampaign() internal {
         _fundAndApprove();
         _addFullRangeLiquidity(FULL_RANGE_LIQUIDITY);
-        handler = new PanicAccountingHandler(hook, panic, IPoolManager(address(manager)), swapRouter, key);
+        // Actors' narrow positions live under a router of their own, apart from the resident full-range one.
+        PoolModifyLiquidityTest actorLp = new PoolModifyLiquidityTest(IPoolManager(address(manager)));
+        handler = new PanicAccountingHandler(hook, panic, IPoolManager(address(manager)), swapRouter, actorLp, key);
         for (uint256 i; i < 3; i++) {
             address actor = handler.actors(i);
             panic.transfer(actor, 1e25);
@@ -27,12 +32,14 @@ abstract contract PanicAccountingInvariantBase is PanicTestBase {
             if (!paired.isAddressZero()) MockERC20(Currency.unwrap(paired)).transfer(actor, 1e25);
             vm.startPrank(actor);
             panic.approve(address(swapRouter), type(uint256).max);
+            panic.approve(address(actorLp), type(uint256).max);
             if (!paired.isAddressZero()) {
                 MockERC20(Currency.unwrap(paired)).approve(address(swapRouter), type(uint256).max);
+                MockERC20(Currency.unwrap(paired)).approve(address(actorLp), type(uint256).max);
             }
             vm.stopPrank();
         }
-        bytes4[] memory selectors = new bytes4[](8);
+        bytes4[] memory selectors = new bytes4[](10);
         selectors[0] = handler.sell.selector;
         selectors[1] = handler.buy.selector;
         selectors[2] = handler.advance.selector;
@@ -41,6 +48,8 @@ abstract contract PanicAccountingInvariantBase is PanicTestBase {
         selectors[5] = handler.buyback.selector;
         selectors[6] = handler.transferPanic.selector;
         selectors[7] = handler.buyExactOutput.selector;
+        selectors[8] = handler.addLiquidity.selector;
+        selectors[9] = handler.removeLiquidity.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
     }
@@ -75,6 +84,8 @@ abstract contract PanicAccountingInvariantBase is PanicTestBase {
         assertEq(panic.balanceOf(address(0)), 0);
         assertEq(panic.balanceOf(address(swapRouter)), 0);
         assertEq(panic.balanceOf(address(lpRouter)), 0);
+        assertEq(panic.balanceOf(address(handler.lpRouter())), 0);
+        assertEq(paired.balanceOf(address(handler.lpRouter())), 0, "LP router keeps no paired currency");
         assertEq(IPoolManager(address(manager)).getNonzeroDeltaCount(), 0, "all v4 debts settled");
         assertFalse(IPoolManager(address(manager)).isUnlocked(), "manager relocked after each action");
     }
@@ -112,6 +123,40 @@ abstract contract PanicAccountingInvariantBase is PanicTestBase {
         handler.claim(2);
         assertEq(handler.successfulExactOutputBuys(), 3);
         assertEq(handler.successfulSwaps(), 5);
+        invariant_conservationReferenceAndSupply();
+    }
+
+    /// @dev A trader's own narrow liquidity around fee-bearing trades, removed in the same block, returns
+    /// principal only; a position held into the next block keeps the fees and in-swap donations it earned.
+    function test_handlerLiquidityAroundTradesInAndAcrossBlocks() public {
+        handler.addLiquidity(0, 1, 2, 1e21);
+        handler.sell(0, 1200 ether);
+        handler.buy(1, 1 ether);
+        vm.recordLogs();
+        handler.addLiquidity(0, 0, 0, 1e15); // Second add in the block: forfeits, pays exact principal.
+        handler.removeLiquidity(0, 5e20); // Partial, same block.
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool forfeited;
+        for (uint256 i; i < logs.length; i++) {
+            if (logs[i].emitter != address(hook) || logs[i].topics[0] != PanicHook.SameBlockFeesForfeited.selector) {
+                continue;
+            }
+            (uint256 pairedFees, uint256 panicFees) = abi.decode(logs[i].data, (uint256, uint256));
+            if (pairedFees + panicFees > 0) forfeited = true;
+        }
+        assertTrue(forfeited, "the same-block position had earned fees, and they were forfeited");
+        handler.removeLiquidity(0, type(uint256).max); // Rest, same block.
+        handler.addLiquidity(1, 0, 3, 1e21);
+        handler.sell(2, 1200 ether);
+        handler.donate(0);
+        handler.advance(12);
+        handler.buy(0, 1 ether);
+        handler.removeLiquidity(1, type(uint256).max); // Held across a block: keeps fees.
+        handler.buyback(2, 0.1 ether);
+        handler.claim(0);
+        assertEq(handler.liquidityAdds(), 3);
+        assertEq(handler.sameBlockRemovals(), 2);
+        assertEq(handler.laterRemovals(), 1);
         invariant_conservationReferenceAndSupply();
     }
 }

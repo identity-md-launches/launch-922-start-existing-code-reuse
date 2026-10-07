@@ -25,6 +25,11 @@ delivery of every bought token to the dead address, fixed token supply, and sett
 deltas. Every successful buyback must also satisfy the 98% reference output floor, including
 tiny budgets. Its independent quote squares the reference price and divides once, without calling
 the hook's quote helper. Failed buybacks must preserve LP fee growth as well as balances and buckets.
+The campaigns also add and remove narrow actor positions (partial and full removals, second adds in
+the same block, zero-liquidity pokes) under their own router. A position touched again in the block of its
+last add must pay or receive exactly its principal, computed with `SqrtPriceMath`, so every fee it
+earned in between is forfeited; one held into a later block must receive at least its principal. Liquidity
+changes must leave every fee bucket, `totalDonated`, and the hook's claim balance unchanged.
 A separate spot-price timeline is integrated over one hour to check the reference;
 it never reads the hook's observation array. Full-range liquidity is kept in these campaigns;
 deferred donations and zero-liquidity failure/recovery are exercised by the existing bucket suite.
